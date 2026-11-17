@@ -50,6 +50,27 @@ curl -X POST -H 'Content-Type: application/json' -d '{"confirm":true}' \
 | 崩溃于"MK 已切换、作业未建"窗口 | 启动对账自动补建迁移作业 |
 | 密钥服务重启 | 主密钥从卷内 SQLite 恢复，已入湖原片逐字节可读 |
 | 销毁回执丢失 | KeyClient 重试并以 `/internal/master/status` 只读核实 |
+| 换钥崩溃在 staging | 暂存密文不完整，启动删除后整体重做，旧版始终供数 |
+| 换钥崩溃在 switching/cleaning | 按图像行指针与文件实况对账：已切规范路径则收敛到 cleaning，否则回 staging 重做；无主暂存启动清理 |
+
+## 5b. 按编号换 DEK（疑似单件 DEK 泄露）
+
+```bash
+curl -X POST http://localhost:8000/images/<image_id>/rekey     # 202 + job_id
+curl -sS http://localhost:8000/rekeys/<job_id>                 # 轮询至终态
+```
+
+状态机：`staging`（取新 DEK、流式验签解密+重加密到 `*.staging.<job>`、
+明文不落盘、核对入仓 SHA-256）→ `switching`（同卷原子 rename + 信封条件
+UPDATE）→ `cleaning`（在途下载排空、确认旧密文解除链接）→ `completed`。
+
+- 切换前任一时刻下载只取完整旧版，切换后只取完整新版；在途下载不受影响。
+- `failed` 仅发生在切换之前（如旧密文 GCM 验签失败），旧版继续供数，
+  修正后可重新发起；同件未完成换钥重复发起返回 `409 rekey_in_progress`。
+- 与主密钥轮换并发时，新信封若绑在非当前 MK 上会先 rewrap 再切换，保证
+  可解包；条件 UPDATE 保证旧信封不覆盖轮换结果。
+- 可选 `REKEY_DRAIN_SECONDS`（默认 30）：清理前等待在途下载排空的上限，
+  超时后依赖 POSIX inode 语义，已打开的下载仍可读完。
 
 ## 6. 已知限制（单实例/SQLite 范围之外）
 

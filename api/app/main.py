@@ -34,11 +34,13 @@ MultiPartParser.spool_max_size = MAX_UPLOAD_BYTES
 from .crypto_stream import IntegrityError, decrypt_stream, encrypt_stream
 from .keyclient import KeyClient, KeyServiceError
 from .metadata import MetadataDB
+from .rekey import RekeyWorker, blob_readers, staging_path
 from .rotation import RotationWorker
 
 db = MetadataDB(DB_PATH)
 keys = KeyClient(KEY_SERVICE_URL, KEY_SERVICE_TOKEN)
 worker: RotationWorker | None = None
+rekey_worker: RekeyWorker | None = None
 main_loop: asyncio.AbstractEventLoop | None = None
 
 
@@ -77,8 +79,14 @@ async def lifespan(app: FastAPI):
     except KeyServiceError as exc:
         print(f"[startup] rotation reconciliation skipped: {exc}")
     worker = RotationWorker(db, keys, main_loop)
+    rekey_worker = RekeyWorker(db, keys, main_loop, BLOB_DIR)
+    # 换钥作业崩溃对账：中断的 staging 重做、switching 按行实况定态、
+    # 无主暂存密文清理；状态均持久在 SQLite，接续不依赖内存。
+    rekey_worker.recover()
     worker.start()
+    rekey_worker.start()
     yield
+    rekey_worker.stop()
     worker.stop()
     await keys.aclose()
     db.close()
@@ -265,15 +273,21 @@ async def upload_image_named(image_id: str, request: Request, response: Response
 def _cipher_chunks(path: str):
     async def gen():
         loop = asyncio.get_running_loop()
-        f = await loop.run_in_executor(None, open, path, "rb")
+        # 登记在途读取：换钥清理旧密文前会等计数归零（即使未归零，
+        # Linux unlink 也保留 inode 直到本读取关闭，下载仍完整）。
+        blob_readers.enter(path)
+        f = None
         try:
+            f = await loop.run_in_executor(None, open, path, "rb")
             while True:
                 chunk = await loop.run_in_executor(None, f.read, 1024 * 1024)
                 if not chunk:
                     break
                 yield chunk
         finally:
-            await loop.run_in_executor(None, f.close)
+            if f is not None:
+                await loop.run_in_executor(None, f.close)
+            blob_readers.exit(path)
     return gen()
 
 
@@ -377,6 +391,66 @@ def _rotation_view(job: dict) -> dict:
     total = max(job["total"], job["migrated"] + job["failed"], 1)
     pct = round(100.0 * (job["migrated"] + job["failed"]) / total, 2)
     return {**{k: v for k, v in job.items()}, "progress_percent": pct}
+
+
+# --------------------------------------------------------------------------
+# 按编号更换 DEK（rekey）
+# --------------------------------------------------------------------------
+_REKEY_VIEW_FIELDS = (
+    "job_id", "image_id", "state", "old_master_key_id", "new_master_key_id",
+    "sha256", "plain_size", "enc_size", "retries", "error",
+    "started_at", "updated_at", "finished_at",
+)
+
+
+def _rekey_view(job: dict) -> dict:
+    # 不回传任何信封密文（old/new_wrapped_dek 与 blob 路径均为内部细节）
+    return {k: job.get(k) for k in _REKEY_VIEW_FIELDS}
+
+
+@app.post("/images/{image_id}/rekey", status_code=202,
+          summary="按编号更换该原片的数据密钥（DEK）：流式重加密到暂存文件，"
+                  "核对入仓摘要后原子切换，旧密文清除后才报完成")
+async def create_rekey(image_id: str):
+    meta = db.get_image(image_id)
+    if meta is None:
+        raise HTTPException(404, detail="image not found")
+    if meta["status"] != "ready":
+        raise HTTPException(409,
+                            detail={"code": f"image_{meta['status']}",
+                                    "message": "only ready images can be re-keyed"})
+    active = db.active_rekey_for_image(image_id)
+    if active is not None:
+        raise HTTPException(409, detail={
+            "code": "rekey_in_progress", "job_id": active["job_id"],
+            "state": active["state"]})
+    if not os.path.exists(meta["blob_path"]):
+        raise HTTPException(410, detail="encrypted blob missing on storage")
+    # 先建持久化作业再返回：请求结束/进程重启都不丢，后台线程接续执行。
+    # 暂存文件与现役密文同卷，切换只是改元数据指针，不跨设备搬运。
+    job_id = "rek-" + uuid.uuid4().hex
+    staged = staging_path(BLOB_DIR, image_id, job_id)
+    db.create_rekey_job(job_id, image_id, meta, staged)
+    return {"job_id": job_id, "image_id": image_id, "state": "staging"}
+
+
+@app.get("/rekeys/{job_id}", summary="查询换钥作业状态")
+async def rekey_status(job_id: str):
+    job = db.get_rekey(job_id)
+    if job is None:
+        raise HTTPException(404, detail="rekey job not found")
+    return _rekey_view(job)
+
+
+@app.get("/images/{image_id}/rekey/latest",
+         summary="该编号最近一次换钥作业")
+async def latest_rekey(image_id: str):
+    if db.get_image(image_id) is None:
+        raise HTTPException(404, detail="image not found")
+    job = db.latest_rekey_for_image(image_id)
+    if job is None:
+        return {"message": "no rekey has ever run", "image_id": image_id}
+    return _rekey_view(job)
 
 
 @app.get("/keys/status", summary="密钥视角状态（代理密钥服务只读接口）")

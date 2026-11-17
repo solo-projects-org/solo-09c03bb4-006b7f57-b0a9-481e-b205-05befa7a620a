@@ -47,9 +47,41 @@ CREATE TABLE IF NOT EXISTS rotation_jobs (
     updated_at      REAL NOT NULL,
     finished_at     REAL
 );
+
+-- 按编号更换 DEK 的作业（状态持久化，API 重启可接续）。
+-- 图像行在整个换钥期间保持 'ready'：切换是 images 单行条件 UPDATE，
+-- 任何时刻下载读到的要么是完整旧版、要么是完整新版。
+CREATE TABLE IF NOT EXISTS rekey_jobs (
+    job_id            TEXT PRIMARY KEY,
+    image_id          TEXT NOT NULL,
+    state             TEXT NOT NULL CHECK (state IN
+                          ('staging','switching','cleaning','completed','failed')),
+    old_master_key_id TEXT,
+    new_master_key_id TEXT,
+    old_wrapped_dek   TEXT,           -- 换钥前信封快照（条件切换用）
+    new_wrapped_dek   TEXT,           -- 新 DEK 的信封（始终密文）
+    old_blob_path     TEXT,
+    staged_blob_path  TEXT,           -- 新 DEK 重加密的暂存密文
+    sha256            TEXT,           -- 入仓摘要（核对通过才允许切换）
+    plain_size        INTEGER,
+    enc_size          INTEGER,
+    retries           INTEGER NOT NULL DEFAULT 0,
+    error             TEXT,
+    started_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL,
+    finished_at       REAL
+);
+CREATE INDEX IF NOT EXISTS idx_rekey_image ON rekey_jobs(image_id);
+CREATE INDEX IF NOT EXISTS idx_rekey_state ON rekey_jobs(state);
 """
 
 TERMINAL_STATES = ("completed", "failed")
+REKEY_TERMINAL = ("completed", "failed")
+REKEY_UPDATABLE = (
+    "state", "old_master_key_id", "new_master_key_id", "old_wrapped_dek",
+    "new_wrapped_dek", "old_blob_path", "staged_blob_path", "sha256",
+    "plain_size", "enc_size", "error",
+)
 
 
 class MetadataDB:
@@ -250,6 +282,118 @@ class MetadataDB:
                 f"UPDATE rotation_jobs SET {', '.join(sets)} WHERE job_id=?",
                 params)
             self.conn.commit()
+
+    # ---- 按号换 DEK 作业 ------------------------------------------------
+    def create_rekey_job(self, job_id: str, image_id: str, meta: dict[str, Any],
+                         staged_path: str) -> str:
+        """登记换钥作业。同一原片存在未完成换钥时拒绝（调用方先查）。
+
+        job_id 由调用方（HTTP 端点）生成并同时用于暂存文件名，保证回执
+        中的 job_id、数据库行、暂存密文路径三者严格一致。"""
+        with self._write_lock:
+            if self.active_rekey_for_image(image_id) is not None:
+                raise RuntimeError("rekey already in progress for image")
+            now = time.time()
+            self.conn.execute(
+                "INSERT INTO rekey_jobs (job_id, image_id, state, "
+                "old_master_key_id, old_wrapped_dek, old_blob_path, "
+                "staged_blob_path, retries, started_at, updated_at) "
+                "VALUES (?, ?, 'staging', ?, ?, ?, ?, 0, ?, ?)",
+                (job_id, image_id, meta["master_key_id"], meta["wrapped_dek"],
+                 meta["blob_path"], staged_path, now, now))
+            self.conn.commit()
+            return job_id
+
+    def get_rekey(self, job_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM rekey_jobs WHERE job_id=?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def latest_rekey_for_image(self, image_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM rekey_jobs WHERE image_id=? "
+            "ORDER BY started_at DESC LIMIT 1", (image_id,)).fetchone()
+        return dict(row) if row else None
+
+    def active_rekey_for_image(self, image_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM rekey_jobs WHERE image_id=? "
+            "AND state NOT IN ('completed','failed') LIMIT 1",
+            (image_id,)).fetchone()
+        return dict(row) if row else None
+
+    def iter_active_rekeys(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM rekey_jobs WHERE state NOT IN ('completed','failed') "
+            "ORDER BY started_at").fetchall()
+        return [dict(r) for r in rows]
+
+    def update_rekey(self, job_id: str, **fields: Any) -> None:
+        """白名单字段更新（只允许 REKEY_UPDATABLE 中的列）。"""
+        sets, params = [], []
+        for key, value in fields.items():
+            if key not in REKEY_UPDATABLE:
+                raise ValueError(f"rekey field not updatable: {key}")
+            sets.append(f"{key}=?")
+            params.append(value[:500] if key == "error" and value else value)
+        if not sets:
+            return
+        sets.append("updated_at=?")
+        params.extend([time.time(), job_id])
+        with self._write_lock:
+            self.conn.execute(
+                f"UPDATE rekey_jobs SET {', '.join(sets)} WHERE job_id=?",
+                params)
+            self.conn.commit()
+
+    def bump_rekey_retry(self, job_id: str, error: str) -> int:
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE rekey_jobs SET retries = retries + 1, error=?, "
+                "updated_at=? WHERE job_id=?",
+                (error[:500], time.time(), job_id))
+            self.conn.commit()
+            row = self.conn.execute(
+                "SELECT retries FROM rekey_jobs WHERE job_id=?",
+                (job_id,)).fetchone()
+            return row["retries"]
+
+    def complete_rekey(self, job_id: str) -> None:
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE rekey_jobs SET state='completed', error=NULL, "
+                "finished_at=?, updated_at=? WHERE job_id=?",
+                (time.time(), time.time(), job_id))
+            self.conn.commit()
+
+    def fail_rekey(self, job_id: str, error: str) -> None:
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE rekey_jobs SET state='failed', error=?, "
+                "finished_at=?, updated_at=? WHERE job_id=?",
+                (error[:500], time.time(), time.time(), job_id))
+            self.conn.commit()
+
+    def switch_rekey_blob(self, job_id: str, expect_master_key_id: str,
+                          expect_wrapped_dek: str, new_master_key_id: str,
+                          new_wrapped_dek: str, plain_size: int,
+                          enc_size: int, sha256: str,
+                          canonical_blob_path: str) -> bool:
+        """原子切换：仅当图像行仍是换钥前快照时，才把信封/DEK/摘要整体
+        换成新版，并把密文指针指向规范路径（同卷 rename 的落点）。
+        返回 False 说明行已被并发者改动（如主密钥轮换的 rewrap），
+        调用方不得覆盖，需重新评估后再切。"""
+        with self._write_lock:
+            cur = self.conn.execute(
+                "UPDATE images SET master_key_id=?, wrapped_dek=?, blob_path=?, "
+                "plain_size=?, enc_size=?, sha256=? "
+                "WHERE image_id=(SELECT image_id FROM rekey_jobs WHERE job_id=?) "
+                "AND master_key_id=? AND wrapped_dek=?",
+                (new_master_key_id, new_wrapped_dek, canonical_blob_path,
+                 plain_size, enc_size, sha256, job_id,
+                 expect_master_key_id, expect_wrapped_dek))
+            self.conn.commit()
+            return cur.rowcount > 0
 
     def close(self):
         c = getattr(self._local, "conn", None)

@@ -56,6 +56,9 @@ docker compose up --build
 | `GET /images/{image_id}` | 按号下载，流式解密、逐帧 GCM 验签、SHA-256 校验 |
 | `GET /images/{image_id}/meta` | 元数据/状态（不返回信封密文） |
 | `GET /images` | 列表 |
+| `POST /images/{image_id}/rekey` | 按编号更换该原片 DEK（202 + job_id），后台流式重加密，旧密文清除后才完成 |
+| `GET /rekeys/{job_id}` | 查询换钥作业状态（staging/switching/cleaning/completed/failed） |
+| `GET /images/{image_id}/rekey/latest` | 该编号最近一次换钥作业 |
 | `POST /rotations` | 发起主密钥轮换（body `{"confirm": true}`），返回 202 + job_id |
 | `GET /rotations/{job_id}` | 轮换进度（state/migrated/failed/progress_percent） |
 | `GET /rotations/latest` | 最近一次轮换 |
@@ -79,7 +82,41 @@ sha256sum slide_001.czi /tmp/slide_001.czi
 JOB=$(curl -sS -X POST -H 'Content-Type: application/json' \
   -d '{"confirm":true}' http://localhost:8000/rotations | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
 watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
+
+# 按编号更换 DEK（怀疑某件原片 DEK 泄露时）
+RJOB=$(curl -sS -X POST http://localhost:8000/images/slide-001/rekey \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
+watch -n1 "curl -sS http://localhost:8000/rekeys/$RJOB"
 ```
+
+## 按编号换 DEK 语义（rekey，需求对照）
+
+值班员怀疑某件已入仓原片的 DEK 泄露时，对该编号发起 `POST /images/{id}/rekey`，
+作业状态持久化在 `rekey_jobs`，由后台常驻线程驱动，API 重启自动接续：
+
+1. **取新 DEK**：向密钥服务 `generate_dek` 取一把全新 DEK（当前 MK 信封包裹），
+   旧 DEK 解出的明文仅在内存中存活。
+2. **流式重加密到暂存**：逐帧 GCM 验签解密旧密文，边解密边用新 DEK 重加密，
+   写入同卷暂存文件 `*.msef.staging.<job>`。**明文不落盘**（无任何明文临时文件，
+   自测在 blob 目录、元数据库、系统临时目录三处核查明文标记）。
+3. **核对入仓摘要才切换**：解密端按入仓登记的 SHA-256 做最终核对，重加密后
+   再二次比对摘要与明文尺寸；任一不符判 `failed`，绝不切换，旧版继续供数。
+4. **原子切换，新旧版本不混杂**：同卷 `os.replace` 把暂存密文原子改名到规范
+   路径，并以换钥前信封快照为 WHERE 条件做单行 UPDATE 切换信封/摘要。
+   切换前任何下载读到的都是**完整旧版**，切换后都是**完整新版**，不存在半成品。
+5. **在途下载完整**：下载打开密文前登记到在途读取计数，清理前先等其排空；
+   即使超时，POSIX 已打开的旧 inode 仍可被读完。新下载只会取到完整旧版或新版。
+6. **旧密文清除后才报完成**：`cleaning` 确认暂存残留消失、规范密文在位才置
+   `completed`；删除受阻则留在 `cleaning` 下轮重试，不提前报完成。
+7. **中断/重启接续**：崩溃在 `staging` 删暂存重做；`switching/cleaning` 按
+   “图像行指针 + 文件实况”对账收敛；无主暂存文件启动时清理。
+8. **与主密钥轮换交错**：轮换的 rewrap 只换信封不换 DEK。换钥切换前若发现新
+   信封所绑 MK 已不是当前 MK，先 rewrap 到当前 MK 再切，**新信封始终可解包**；
+   条件 UPDATE 保证**旧信封绝不覆盖轮换结果**；若该 MK 已被销毁则退回
+   `staging` 重新取钥，绝不发布不可解包的信封。
+
+换钥与轮换可并发：同件原片同时只允许一个未完成换钥（重复发起返回
+`409 rekey_in_progress`）；终态后可再次换钥。
 
 ## 轮换语义（需求对照）
 
@@ -114,7 +151,7 @@ KEY_DESTROY_DROP_RECEIPT=true docker compose up --build keystore
 ## 自测
 
 ```bash
-# tests/ 下为真实 uvicorn 子进程的端到端测试（22 项，含离线加密单测）
+# tests/ 下为真实 uvicorn 子进程的端到端测试（32 项，含离线加密单测）
 python -m pytest tests/ -q
 ```
 
@@ -123,7 +160,10 @@ python -m pytest tests/ -q
 篡改 GCM 失败、完整轮换（信封迁移+正文不动+二次轮换仍不动+销毁后可读）、
 进度与并发轮换拒绝、慢密钥服务并发、在途下载跨销毁、销毁丢回执自动核实、
 双服务重启可读性、轮换中途重启接续、崩溃在途上传不晚发布、
-跨越轮换的上传自动改绑。
+跨越轮换的上传自动改绑；以及按编号换 DEK（R1–R8，见 `tests/test_rekey.py`）：
+换钥后旧 DEK 解不开新密文、在途下载完整、并发下载只取完整版本、验签失败
+旧版继续供数、重启/双重重启接续且无暂存残留、与主密钥轮换交错信封始终可
+解包、二次换钥与并发拒绝、入口校验。
 
 ## 限制与生产化建议（见 docs/ 下说明）
 
